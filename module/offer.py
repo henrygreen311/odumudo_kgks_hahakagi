@@ -4,7 +4,9 @@ from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
 def get_account_credentials(supabase, account_id: int = 1) -> Dict[str, str]:
+    """Fetch auth, user_agent, uid from Supabase."""
     result = (
         supabase.table("jumptask")
         .select("auth, user_agent, uid")
@@ -25,7 +27,9 @@ def fetch_offers(
     order: str = "jmpt_amount",
     direction: str = "desc",
 ) -> Optional[List[Dict[str, Any]]]:
+    """Fetch offers from the JumpTask API with full debug logging."""
     creds = get_account_credentials(supabase, account_id)
+
     headers = {
         "User-Agent": creds["user_agent"],
         "Accept": "application/json, text/plain, */*",
@@ -40,6 +44,7 @@ def fetch_offers(
         "Sec-Gpc": "1",
         "Te": "trailers",
     }
+
     base_url = "https://api.jumptask.io/offerwall/offers"
     params = {
         "direction": direction,
@@ -50,21 +55,33 @@ def fetch_offers(
 
     try:
         resp = requests.get(base_url, headers=headers, params=params, timeout=15)
-        # Log status and basic info for debugging
+
+        # ---- DEBUG LOGGING ----
         logger.info(f"Offers API status: {resp.status_code}")
+        logger.info(f"Response headers: {dict(resp.headers)}")
+
+        # Log the raw body (first 500 chars) to inspect
+        raw_body = resp.text
+        logger.info(f"Response body (first 500 chars): {raw_body[:500]}")
+
+        # If status is not 200, log full body and return None
         if resp.status_code != 200:
-            logger.error(f"Unexpected status: {resp.status_code}, body: {resp.text[:500]}")
+            logger.error(f"Non-200 response, raw body:\n{raw_body}")
             return None
 
         # Ensure JSON content
-        if 'application/json' not in resp.headers.get('Content-Type', ''):
-            logger.error(f"Non-JSON response: {resp.text[:200]}")
+        content_type = resp.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            logger.error(f"Non-JSON Content-Type: {content_type}")
+            logger.error(f"Raw body:\n{raw_body}")
             return None
 
         data = resp.json()
+
     except requests.exceptions.JSONDecodeError as e:
-        logger.error(f"Invalid JSON: {e}")
-        logger.error(f"Status: {resp.status_code}, Body preview: {resp.text[:500]}")
+        logger.error(f"JSON decode error: {e}")
+        logger.error(f"Status: {resp.status_code}")
+        logger.error(f"Raw content (first 1000 chars): {resp.text[:1000]}")
         return None
     except requests.RequestException as e:
         logger.error(f"Request failed: {e}")
@@ -77,10 +94,16 @@ def fetch_offers(
     if not isinstance(offers, list):
         logger.warning("Response does not contain an offers list")
         return None
+
     return offers
 
 
 def classify_offers(offers: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, str]]]:
+    """
+    Split offers into two categories:
+      - click_ids: list of offer IDs for link tasks
+      - text_tasks: list of dicts {'offer_id': ..., 'instructions': ...} for text tasks
+    """
     click_ids = []
     text_tasks = []
     for offer in offers:
@@ -89,17 +112,22 @@ def classify_offers(offers: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[
             continue
         instr = offer.get("instructions", "")
         instr_lower = instr.lower()
+
         if "click on the last link" in instr_lower or ("click" in instr_lower and "link" in instr_lower):
             click_ids.append(offer_id)
+
         if "enter" in instr_lower and "text" in instr_lower and "field below" in instr_lower:
             text_tasks.append({"offer_id": offer_id, "instructions": instr})
+
     return click_ids, text_tasks
 
 
 def fetch_and_log_offers(supabase, account_id: int = 1) -> Optional[List[Dict[str, Any]]]:
+    """Fetch offers, log counts, and dispatch to link/text processors."""
     offers = fetch_offers(supabase, account_id)
     if offers is None:
         return None
+
     count = len(offers)
     logger.info(f"Total offers fetched: {count}")
 
@@ -118,3 +146,11 @@ def fetch_and_log_offers(supabase, account_id: int = 1) -> Optional[List[Dict[st
         process_text_offers(supabase, account_id, text_tasks)
 
     return offers
+
+
+if __name__ == "__main__":
+    # Standalone test
+    from index import create_supabase_client
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    supabase = create_supabase_client()
+    fetch_and_log_offers(supabase, account_id=1)
