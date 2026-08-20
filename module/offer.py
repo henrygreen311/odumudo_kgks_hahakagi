@@ -1,10 +1,8 @@
-# module/offer.py
 import logging
 import requests
 from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-
 
 def get_account_credentials(supabase, account_id: int = 1) -> Dict[str, str]:
     result = (
@@ -49,13 +47,32 @@ def fetch_offers(
         "search": "",
         "tags[]": tag,
     }
+
     try:
         resp = requests.get(base_url, headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
+        # Log status and basic info for debugging
+        logger.info(f"Offers API status: {resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"Unexpected status: {resp.status_code}, body: {resp.text[:500]}")
+            return None
+
+        # Ensure JSON content
+        if 'application/json' not in resp.headers.get('Content-Type', ''):
+            logger.error(f"Non-JSON response: {resp.text[:200]}")
+            return None
+
         data = resp.json()
-    except Exception as e:
-        logger.error(f"Failed to fetch offers: {e}")
+    except requests.exceptions.JSONDecodeError as e:
+        logger.error(f"Invalid JSON: {e}")
+        logger.error(f"Status: {resp.status_code}, Body preview: {resp.text[:500]}")
         return None
+    except requests.RequestException as e:
+        logger.error(f"Request failed: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return None
+
     offers = data.get("data", {}).get("offers")
     if not isinstance(offers, list):
         logger.warning("Response does not contain an offers list")
@@ -64,11 +81,6 @@ def fetch_offers(
 
 
 def classify_offers(offers: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, str]]]:
-    """
-    Returns:
-      - click_ids: list of offer IDs for link tasks
-      - text_tasks: list of dicts {'offer_id': ..., 'instructions': ...} for text tasks
-    """
     click_ids = []
     text_tasks = []
     for offer in offers:
@@ -77,10 +89,8 @@ def classify_offers(offers: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[
             continue
         instr = offer.get("instructions", "")
         instr_lower = instr.lower()
-        # Link task classification
         if "click on the last link" in instr_lower or ("click" in instr_lower and "link" in instr_lower):
             click_ids.append(offer_id)
-        # Text task classification
         if "enter" in instr_lower and "text" in instr_lower and "field below" in instr_lower:
             text_tasks.append({"offer_id": offer_id, "instructions": instr})
     return click_ids, text_tasks
@@ -108,10 +118,3 @@ def fetch_and_log_offers(supabase, account_id: int = 1) -> Optional[List[Dict[st
         process_text_offers(supabase, account_id, text_tasks)
 
     return offers
-
-
-if __name__ == "__main__":
-    from index import create_supabase_client
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    supabase = create_supabase_client()
-    fetch_and_log_offers(supabase, account_id=1)
