@@ -5,16 +5,19 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
+import requests
 
-from src.task_utils import follow_affiliate_link, get_tune_flow, get_affiliate_url
+from src.task_utils import get_tune_flow, get_affiliate_url
 from src.proxy_client import proxy_request
 
 logger = logging.getLogger(__name__)
 
 FINAL_POST_DELAY = 2.5 * 60  # 2.5 minutes
-MAX_WORKERS = 1
+MAX_WORKERS = 5
+MAX_CANDIDATES = 5  # try up to 5 topics per offer
 
 # Caches
 _youtube_cache = {}
@@ -105,28 +108,147 @@ def extract_topic_from_description(description: str, timestamp: str) -> Optional
     return None
 
 
-def get_topic_for_offer(instructions: str) -> Optional[str]:
+def get_topic_candidates(instructions: str, max_candidates: int = MAX_CANDIDATES) -> List[str]:
+    """
+    Search YouTube for the query, collect topics from descriptions, return unique candidates.
+    """
     query = extract_search_query(instructions)
     if not query:
-        return None
+        return []
     timestamp = extract_timestamp(instructions)
     if not timestamp:
-        return None
+        return []
 
     logger.info(f"Searching YouTube for '{query}' with timestamp {timestamp}...")
     videos = search_youtube(query, max_results=50)
+    candidates = []
+    seen = set()
     for video in videos:
         topic = extract_topic_from_description(video['description'], timestamp)
-        if topic:
-            logger.info(f"Found topic for {timestamp}: '{topic}' (from video: {video['title']})")
-            return topic
-    logger.warning(f"No topic found for timestamp {timestamp} in any of {len(videos)} videos.")
-    return None
+        if topic and topic not in seen:
+            candidates.append(topic)
+            seen.add(topic)
+            if len(candidates) >= max_candidates:
+                break
+    logger.info(f"Found {len(candidates)} topic candidates for {timestamp}: {candidates}")
+    return candidates
+
+
+# ---------- Affiliate link handler (with fallback for 200) ----------
+def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[str, str]]:
+    """
+    Follow the affiliate link (go2cloud.org) to get transaction_id and other params.
+    Handles both 302 and 200 responses.
+    """
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-User": "?1",
+        "Sec-Gpc": "1",
+        "Priority": "u=0, i",
+        "Te": "trailers",
+        "Connection": "keep-alive",
+    }
+    try:
+        resp = requests.get(affiliate_url, headers=headers, timeout=15, allow_redirects=False)
+        status = resp.status_code
+
+        # Case 1: 302 redirect – extract Location
+        if status == 302:
+            location = resp.headers.get("Location")
+            if not location:
+                logger.error("No Location header in 302 response")
+                return None
+            parsed = urlparse(location)
+            query = parse_qs(parsed.query)
+            transaction_id = query.get("transaction_id", [None])[0]
+            destination = query.get("destination", [None])[0]
+            advertiser = query.get("advertiser", [None])[0]
+            user_id = query.get("user_id", [None])[0]
+            if not all([transaction_id, destination, advertiser, user_id]):
+                logger.error(f"Missing required parameters in Location: {location}")
+                return None
+            return {
+                "transaction_id": transaction_id,
+                "destination": destination,
+                "advertiser": advertiser,
+                "user_id": user_id,
+            }
+
+        # Case 2: 200 OK – try to extract params from body
+        elif status == 200:
+            logger.warning("Affiliate link returned 200 instead of 302. Attempting to parse response.")
+            body = resp.text
+
+            # Look for a meta refresh or a link with the target URL
+            patterns = [
+                r'<meta[^>]+url=([^"\']+)[\'"]',
+                r'<a[^>]+href=(["\'])([^"\']+)\1',
+                r'window\.location\s*=\s*["\']([^"\']+)["\']',
+                r'location\.href\s*=\s*["\']([^"\']+)["\']',
+            ]
+            target_url = None
+            for pattern in patterns:
+                match = re.search(pattern, body, re.IGNORECASE)
+                if match:
+                    target_url = match.group(1) if len(match.groups()) == 1 else match.group(2)
+                    break
+
+            if not target_url:
+                # Try to find transaction_id directly in the body (maybe it's in a JSON)
+                transaction_id_match = re.search(r'transaction_id["\']?\s*[:=]\s*["\']?([a-f0-9]+)["\']?', body, re.IGNORECASE)
+                if transaction_id_match:
+                    transaction_id = transaction_id_match.group(1)
+                    # We still need other params; we can try to find them too
+                    destination_match = re.search(r'destination["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                    advertiser_match = re.search(r'advertiser["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                    user_id_match = re.search(r'user_id["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                    destination = destination_match.group(1) if destination_match else "https://youtube.com"
+                    advertiser = advertiser_match.group(1) if advertiser_match else "jtyoutube"
+                    user_id = user_id_match.group(1) if user_id_match else None
+                    if transaction_id and user_id:
+                        return {
+                            "transaction_id": transaction_id,
+                            "destination": destination,
+                            "advertiser": advertiser,
+                            "user_id": user_id,
+                        }
+                # If we found a URL, parse it
+                if target_url:
+                    parsed = urlparse(target_url)
+                    query = parse_qs(parsed.query)
+                    transaction_id = query.get("transaction_id", [None])[0]
+                    destination = query.get("destination", [None])[0]
+                    advertiser = query.get("advertiser", [None])[0]
+                    user_id = query.get("user_id", [None])[0]
+                    if all([transaction_id, destination, advertiser, user_id]):
+                        return {
+                            "transaction_id": transaction_id,
+                            "destination": destination,
+                            "advertiser": advertiser,
+                            "user_id": user_id,
+                        }
+
+            logger.error("Could not extract transaction_id from 200 response.")
+            return None
+
+        else:
+            logger.error(f"Affiliate link returned unexpected status: {status}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Failed to follow affiliate link: {e}")
+        return None
 
 
 # ---------- Database helpers with retries ----------
 def get_existing_challenge(supabase, offer_id: str) -> Optional[str]:
-    """Query failed_text_offers with caching and retries."""
     if offer_id in _challenge_cache:
         return _challenge_cache[offer_id]
 
@@ -148,7 +270,7 @@ def get_existing_challenge(supabase, offer_id: str) -> Optional[str]:
                 return None
             else:
                 logger.warning(f"Supabase error (attempt {attempt}) for {offer_id}: {e}. Retrying in {attempt}s...")
-                time.sleep(attempt)  # 1s, 2s
+                time.sleep(attempt)
     return None
 
 
@@ -161,8 +283,8 @@ def delete_failed_offer(supabase, offer_id: str) -> None:
         logger.error(f"Error deleting offer {offer_id}: {e}")
 
 
-def store_failed_topic_offer(supabase, offer_id: str, instructions: str, search_query: str, timestamp: str) -> None:
-    """Store failed topic offer details for manual review."""
+def store_failed_offer(supabase, offer_id: str, instructions: str) -> None:
+    """Store failed offer details – keep it simple, only task_id, instruction, challenge (null)."""
     table = "failed_text_offers"
     # Check if already exists with a challenge (use retry)
     existing = None
@@ -189,18 +311,14 @@ def store_failed_topic_offer(supabase, offer_id: str, instructions: str, search_
     data = {
         "task_id": offer_id,
         "instruction": instructions,
-        "image_url": None,
-        "challenge": None,
-        "search_query": search_query,
-        "timestamp": timestamp,
-        "type": "topic",
+        "challenge": None,  # leave null for manual fill
     }
     try:
         if existing:
             supabase.table(table).update(data).eq("task_id", offer_id).execute()
         else:
             supabase.table(table).insert(data).execute()
-        logger.info(f"Stored failed topic offer {offer_id} in DB.")
+        logger.info(f"Stored failed offer {offer_id} in DB.")
     except Exception as e:
         logger.error(f"Failed to store offer {offer_id}: {e}")
 
@@ -232,20 +350,11 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
         used_db = True
         logger.info(f"Using existing challenge from DB: {challenge}")
     else:
-        search_query = extract_search_query(instructions)
-        if not search_query:
-            logger.info("Skipping: could not extract search query")
-            return False
-        timestamp = extract_timestamp(instructions)
-        if not timestamp:
-            logger.info("Skipping: could not extract timestamp")
-            return False
-        logger.info(f"Search query: '{search_query}', timestamp: {timestamp}")
-
-        challenge = get_topic_for_offer(instructions)
-        if not challenge:
-            logger.warning(f"No topic found for {offer_id}. Storing for manual review.")
-            store_failed_topic_offer(supabase, offer_id, instructions, search_query, timestamp)
+        # Get list of topic candidates
+        candidates = get_topic_candidates(instructions)
+        if not candidates:
+            logger.warning(f"No topic candidates found for {offer_id}. Storing for manual review.")
+            store_failed_offer(supabase, offer_id, instructions)
             return False
         used_db = False
 
@@ -257,45 +366,63 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
     user_agent = account["user_agent"]
     max_retries = 3
 
-    for attempt in range(1, max_retries + 1):
-        logger.info(f"Attempt {attempt} for topic offer {offer_id}")
-        affiliate_url = get_affiliate_url(account, offer_id)
-        if not affiliate_url:
-            continue
+    # If using DB challenge, we try it once (maybe with retries). Otherwise, iterate candidates.
+    if used_db:
+        challenges_to_try = [existing]
+    else:
+        challenges_to_try = candidates
 
-        flow_params = follow_affiliate_link(affiliate_url, user_agent)
-        if not flow_params:
-            continue
+    for challenge in challenges_to_try:
+        logger.info(f"Trying challenge: '{challenge}' for offer {offer_id}")
 
-        if not get_tune_flow(account, offer_id,
-                             flow_params["transaction_id"],
-                             flow_params["user_id"],
-                             flow_params["destination"],
-                             flow_params["advertiser"]):
-            continue
+        for attempt in range(1, max_retries + 1):
+            logger.info(f"Attempt {attempt} for topic offer {offer_id} (challenge: {challenge[:30]}...)")
+            affiliate_url = get_affiliate_url(account, offer_id)
+            if not affiliate_url:
+                continue
 
-        logger.info(f"Waiting {FINAL_POST_DELAY/60:.1f} minutes before final POST for {offer_id}...")
-        time.sleep(FINAL_POST_DELAY)
+            flow_params = follow_affiliate_link(affiliate_url, user_agent)
+            if not flow_params:
+                continue
 
-        status, data, invalid = post_tune_flow_with_challenge(account, offer_id, uid, challenge)
-        if invalid:
-            logger.info(f"Status: {status}, Invalid challenge: {data}")
-            if not used_db:
-                store_failed_topic_offer(supabase, offer_id, instructions, search_query, timestamp)
-            else:
-                logger.warning(f"Offer {offer_id} had DB challenge but it's invalid.")
-            return False
+            if not get_tune_flow(account, offer_id,
+                                 flow_params["transaction_id"],
+                                 flow_params["user_id"],
+                                 flow_params["destination"],
+                                 flow_params["advertiser"]):
+                continue
 
-        if status == 200 and data and data.get("offer_id") == offer_id:
-            logger.info(f"Status: {status}, Successful: {data}")
-            if used_db:
-                delete_failed_offer(supabase, offer_id)
-            return True
+            logger.info(f"Waiting {FINAL_POST_DELAY/60:.1f} minutes before final POST for {offer_id}...")
+            time.sleep(FINAL_POST_DELAY)
 
-        if status is not None:
-            logger.warning(f"Attempt {attempt} failed with status {status}")
+            status, data, invalid = post_tune_flow_with_challenge(account, offer_id, uid, challenge)
+            if invalid:
+                logger.info(f"Status: {status}, Invalid challenge: {data}")
+                # If it's invalid and we are not using DB, try next candidate
+                break  # break out of retry loop to try next challenge
 
-    logger.error(f"Topic offer {offer_id} failed after {max_retries} attempts.")
+            if status == 200 and data and data.get("offer_id") == offer_id:
+                logger.info(f"Status: {status}, Successful: {data}")
+                if used_db:
+                    delete_failed_offer(supabase, offer_id)
+                return True
+
+            if status is not None:
+                logger.warning(f"Attempt {attempt} failed with status {status}")
+
+        # If we get here, this challenge failed; move to next candidate
+        if not used_db:
+            logger.info(f"Challenge '{challenge}' failed, trying next candidate...")
+        else:
+            # DB challenge failed (all retries), we stop
+            break
+
+    # If we exhausted all candidates, store the offer for manual review
+    if not used_db:
+        logger.warning(f"All {len(candidates)} candidates failed for {offer_id}. Storing for manual review.")
+        store_failed_offer(supabase, offer_id, instructions)
+
+    logger.error(f"Topic offer {offer_id} failed after trying all candidates.")
     return False
 
 
