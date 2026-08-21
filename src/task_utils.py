@@ -83,9 +83,9 @@ def get_tune_flow(account, offer_id: str, transaction_id: str, user_id: str, des
         "advertiser": advertiser,
     }
     response = proxy_request(account, endpoint, params=params)
-    # Expect 302 Found
-    if response.status_code == 302:
+    # Accept 200 (proxy may force it) or 302 (original behavior)
+    if response.status_code in (200, 302):
         return True
     else:
-        logger.error(f"Tune flow GET returned {response.status_code}, expected 302")
+        logger.error(f"Tune flow GET returned {response.status_code}, expected 200 or 302")
         return False
