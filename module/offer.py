@@ -3,12 +3,10 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from src.proxy_client import proxy_request
 
-# Disabled link and topic taskers
-# from src.link_tasker import process_link_offers
-# from src.topic_tasker import process_topic_offers
-
-# Enable hashtag_tasker
+# Enable all task processors
+from src.link_tasker import process_link_offers
 from src.hashtag_tasker import process_text_offers
+from src.topic_tasker import process_topic_offers
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +54,15 @@ def classify_offers(offers: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[
             continue
         instr = offer.get("instructions", "")
         instr_lower = instr.lower()
+        # Link tasks: contains "click on the last link" or (click + link)
         if "click on the last link" in instr_lower or ("click" in instr_lower and "link" in instr_lower):
             click_ids.append(offer_id)
             continue
+        # Topic tasks: contains "topic name" and "starts at"
         if "topic name" in instr_lower and "starts at" in instr_lower:
             topic_tasks.append({"offer_id": offer_id, "instructions": instr})
             continue
+        # Text (hashtag) tasks: contains "enter", "text", and "field below"
         if "enter" in instr_lower and "text" in instr_lower and "field below" in instr_lower:
             text_tasks.append({"offer_id": offer_id, "instructions": instr})
     return click_ids, text_tasks, topic_tasks
@@ -76,20 +77,18 @@ def fetch_and_log_offers(supabase, account_id: int = 1) -> Optional[List[Dict[st
     logger.info(f"Total offers fetched: {count}")
 
     click_ids, text_tasks, topic_tasks = classify_offers(offers)
-    logger.info(f"Click link task: {len(click_ids)}")
-    logger.info(f"Enter text task: {len(text_tasks)}")
-    logger.info(f"Topic task: {len(topic_tasks)}")
+    logger.info(f"Click link tasks: {len(click_ids)}")
+    logger.info(f"Text (hashtag) tasks: {len(text_tasks)}")
+    logger.info(f"Topic tasks: {len(topic_tasks)}")
 
     if click_ids:
-        # process_link_offers(account, click_ids)
-        pass
+        process_link_offers(account, click_ids)
 
     if text_tasks:
         process_text_offers(supabase, account, text_tasks)
 
     if topic_tasks:
-        # process_topic_offers(supabase, account, topic_tasks)
-        pass
+        process_topic_offers(supabase, account, topic_tasks)
 
     return offers
 
