@@ -16,8 +16,8 @@ from src.proxy_client import proxy_request
 logger = logging.getLogger(__name__)
 
 FINAL_POST_DELAY = 2.5 * 60  # 2.5 minutes
-MAX_WORKERS = 5
-MAX_CANDIDATES = 5  # try up to 5 topics per offer
+MAX_WORKERS = 5              # reduced to avoid connection issues
+MAX_CANDIDATES = 5           # try up to 5 topics per offer
 
 # Caches
 _youtube_cache = {}
@@ -39,14 +39,15 @@ def extract_search_query(instructions: str) -> Optional[str]:
 
 
 def extract_timestamp(instructions: str) -> Optional[str]:
+    # Match both 0:30 and 00:30, and also 2:17 or 02:17
     match = re.search(r'\b(\d{1,2}:\d{2}(?::\d{2})?)\b', instructions)
     if match:
         return match.group(1)
     return None
 
 
-def search_youtube(query: str, max_results: int = 50) -> List[Dict[str, str]]:
-    cache_key = f"{query}_{max_results}"
+def search_youtube(query: str, max_results: int = 50, proxy: Optional[str] = None) -> List[Dict[str, str]]:
+    cache_key = f"{query}_{max_results}_{proxy}"
     if cache_key in _youtube_cache:
         return _youtube_cache[cache_key]
 
@@ -58,6 +59,13 @@ def search_youtube(query: str, max_results: int = 50) -> List[Dict[str, str]]:
         'skip_download': True,
         'ignoreerrors': True,
     }
+
+    if proxy and not proxy.startswith(('http://', 'https://')):
+        proxy = 'http://' + proxy
+    if proxy:
+        ydl_opts['proxy'] = proxy
+        logger.info(f"Using proxy for YouTube: {proxy}")
+
     search_url = f"ytsearch{max_results}:{query}"
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -84,13 +92,14 @@ def extract_topic_from_description(description: str, timestamp: str) -> Optional
     if not description or not timestamp:
         return None
     ts_escaped = re.escape(timestamp)
+    # Look for timestamp followed by optional separator and then text
     pattern = re.compile(rf'{ts_escaped}\s*[-:]\s*(.*?)(?:\n|\.|$)', re.IGNORECASE)
     match = pattern.search(description)
     if match:
         topic = match.group(1).strip()
         if topic:
             return topic
-    # Fallback: grab ~100 chars after timestamp
+    # Fallback: grab 100 chars after timestamp
     idx = description.lower().find(timestamp.lower())
     if idx != -1:
         start = idx + len(timestamp)
@@ -108,19 +117,18 @@ def extract_topic_from_description(description: str, timestamp: str) -> Optional
     return None
 
 
-def get_topic_candidates(instructions: str, max_candidates: int = MAX_CANDIDATES) -> List[str]:
-    """
-    Search YouTube for the query, collect topics from descriptions, return unique candidates.
-    """
+def get_topic_candidates(instructions: str, proxy: Optional[str] = None, max_candidates: int = MAX_CANDIDATES) -> List[str]:
     query = extract_search_query(instructions)
     if not query:
+        logger.warning("Could not extract search query from instructions.")
         return []
     timestamp = extract_timestamp(instructions)
     if not timestamp:
+        logger.warning("Could not extract timestamp from instructions.")
         return []
 
     logger.info(f"Searching YouTube for '{query}' with timestamp {timestamp}...")
-    videos = search_youtube(query, max_results=50)
+    videos = search_youtube(query, max_results=50, proxy=proxy)
     candidates = []
     seen = set()
     for video in videos:
@@ -130,16 +138,15 @@ def get_topic_candidates(instructions: str, max_candidates: int = MAX_CANDIDATES
             seen.add(topic)
             if len(candidates) >= max_candidates:
                 break
-    logger.info(f"Found {len(candidates)} topic candidates for {timestamp}: {candidates}")
+    if candidates:
+        logger.info(f"Found {len(candidates)} topic candidates for {timestamp}: {candidates}")
+    else:
+        logger.warning(f"No topic candidates found for timestamp {timestamp} in {len(videos)} videos.")
     return candidates
 
 
 # ---------- Affiliate link handler (with fallback for 200) ----------
 def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[str, str]]:
-    """
-    Follow the affiliate link (go2cloud.org) to get transaction_id and other params.
-    Handles both 302 and 200 responses.
-    """
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -159,7 +166,6 @@ def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[
         resp = requests.get(affiliate_url, headers=headers, timeout=15, allow_redirects=False)
         status = resp.status_code
 
-        # Case 1: 302 redirect – extract Location
         if status == 302:
             location = resp.headers.get("Location")
             if not location:
@@ -181,12 +187,10 @@ def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[
                 "user_id": user_id,
             }
 
-        # Case 2: 200 OK – try to extract params from body
         elif status == 200:
             logger.warning("Affiliate link returned 200 instead of 302. Attempting to parse response.")
             body = resp.text
 
-            # Look for a meta refresh or a link with the target URL
             patterns = [
                 r'<meta[^>]+url=([^"\']+)[\'"]',
                 r'<a[^>]+href=(["\'])([^"\']+)\1',
@@ -200,41 +204,38 @@ def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[
                     target_url = match.group(1) if len(match.groups()) == 1 else match.group(2)
                     break
 
-            if not target_url:
-                # Try to find transaction_id directly in the body (maybe it's in a JSON)
-                transaction_id_match = re.search(r'transaction_id["\']?\s*[:=]\s*["\']?([a-f0-9]+)["\']?', body, re.IGNORECASE)
-                if transaction_id_match:
-                    transaction_id = transaction_id_match.group(1)
-                    # We still need other params; we can try to find them too
-                    destination_match = re.search(r'destination["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
-                    advertiser_match = re.search(r'advertiser["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
-                    user_id_match = re.search(r'user_id["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
-                    destination = destination_match.group(1) if destination_match else "https://youtube.com"
-                    advertiser = advertiser_match.group(1) if advertiser_match else "jtyoutube"
-                    user_id = user_id_match.group(1) if user_id_match else None
-                    if transaction_id and user_id:
-                        return {
-                            "transaction_id": transaction_id,
-                            "destination": destination,
-                            "advertiser": advertiser,
-                            "user_id": user_id,
-                        }
-                # If we found a URL, parse it
-                if target_url:
-                    parsed = urlparse(target_url)
-                    query = parse_qs(parsed.query)
-                    transaction_id = query.get("transaction_id", [None])[0]
-                    destination = query.get("destination", [None])[0]
-                    advertiser = query.get("advertiser", [None])[0]
-                    user_id = query.get("user_id", [None])[0]
-                    if all([transaction_id, destination, advertiser, user_id]):
-                        return {
-                            "transaction_id": transaction_id,
-                            "destination": destination,
-                            "advertiser": advertiser,
-                            "user_id": user_id,
-                        }
+            if target_url:
+                parsed = urlparse(target_url)
+                query = parse_qs(parsed.query)
+                transaction_id = query.get("transaction_id", [None])[0]
+                destination = query.get("destination", [None])[0]
+                advertiser = query.get("advertiser", [None])[0]
+                user_id = query.get("user_id", [None])[0]
+                if all([transaction_id, destination, advertiser, user_id]):
+                    return {
+                        "transaction_id": transaction_id,
+                        "destination": destination,
+                        "advertiser": advertiser,
+                        "user_id": user_id,
+                    }
 
+            # Fallback: search body for transaction_id
+            tx_match = re.search(r'transaction_id["\']?\s*[:=]\s*["\']?([a-f0-9]+)["\']?', body, re.IGNORECASE)
+            if tx_match:
+                transaction_id = tx_match.group(1)
+                dest_match = re.search(r'destination["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                adv_match = re.search(r'advertiser["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                user_match = re.search(r'user_id["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                destination = dest_match.group(1) if dest_match else "https://youtube.com"
+                advertiser = adv_match.group(1) if adv_match else "jtyoutube"
+                user_id = user_match.group(1) if user_match else None
+                if transaction_id and user_id:
+                    return {
+                        "transaction_id": transaction_id,
+                        "destination": destination,
+                        "advertiser": advertiser,
+                        "user_id": user_id,
+                    }
             logger.error("Could not extract transaction_id from 200 response.")
             return None
 
@@ -252,7 +253,7 @@ def get_existing_challenge(supabase, offer_id: str) -> Optional[str]:
     if offer_id in _challenge_cache:
         return _challenge_cache[offer_id]
 
-    for attempt in range(1, 4):
+    for attempt in range(1, 5):  # increased to 5 attempts
         try:
             resp = (
                 supabase.table("failed_text_offers")
@@ -264,13 +265,13 @@ def get_existing_challenge(supabase, offer_id: str) -> Optional[str]:
             _challenge_cache[offer_id] = challenge
             return challenge
         except Exception as e:
-            if attempt == 3:
-                logger.warning(f"Failed to fetch challenge for {offer_id} after 3 attempts: {e}")
+            if attempt == 5:
+                logger.warning(f"Failed to fetch challenge for {offer_id} after 5 attempts: {e}")
                 _challenge_cache[offer_id] = None
                 return None
             else:
-                logger.warning(f"Supabase error (attempt {attempt}) for {offer_id}: {e}. Retrying in {attempt}s...")
-                time.sleep(attempt)
+                logger.warning(f"Supabase error (attempt {attempt}) for {offer_id}: {e}. Retrying in {attempt*2}s...")
+                time.sleep(attempt * 2)  # 2s, 4s, 6s, 8s
     return None
 
 
@@ -283,12 +284,12 @@ def delete_failed_offer(supabase, offer_id: str) -> None:
         logger.error(f"Error deleting offer {offer_id}: {e}")
 
 
-def store_failed_offer(supabase, offer_id: str, instructions: str) -> None:
-    """Store failed offer details – keep it simple, only task_id, instruction, challenge (null)."""
+def store_failed_offer(supabase, offer_id: str, instructions: str, search_query: Optional[str] = None, timestamp: Optional[str] = None) -> None:
+    """Store failed offer with all available columns to avoid schema errors."""
     table = "failed_text_offers"
     # Check if already exists with a challenge (use retry)
     existing = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 5):
         try:
             resp = (
                 supabase.table(table)
@@ -299,7 +300,7 @@ def store_failed_offer(supabase, offer_id: str, instructions: str) -> None:
             existing = resp.data
             break
         except Exception as e:
-            if attempt == 3:
+            if attempt == 5:
                 logger.error(f"Failed to check existing row for {offer_id}: {e}")
                 return
             time.sleep(attempt)
@@ -308,10 +309,15 @@ def store_failed_offer(supabase, offer_id: str, instructions: str) -> None:
         logger.info(f"Offer {offer_id} already has a challenge, skipping storage.")
         return
 
+    # Build data with all columns that may exist
     data = {
         "task_id": offer_id,
         "instruction": instructions,
-        "challenge": None,  # leave null for manual fill
+        "challenge": None,
+        "search_query": search_query,
+        "timestamp": timestamp,
+        "type": "topic",
+        "image_url": None,  # if column exists
     }
     try:
         if existing:
@@ -343,6 +349,15 @@ def post_tune_flow_with_challenge(account, offer_id: str, user_id: str, challeng
 def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx: int, total: int) -> bool:
     logger.info(f"ID={offer_id} Processing {idx}/{total}")
 
+    # Extract proxy for YouTube
+    proxy_for_youtube = None
+    proxy_url = account.get("proxy_url", "")
+    if proxy_url and "infinityfree" not in proxy_url and "jumptask" not in proxy_url:
+        if not proxy_url.startswith(('http://', 'https://')):
+            proxy_url = 'http://' + proxy_url
+        proxy_for_youtube = proxy_url
+        logger.info(f"Using YouTube proxy: {proxy_for_youtube}")
+
     # Check DB for manually filled challenge
     existing = get_existing_challenge(supabase, offer_id)
     if existing:
@@ -350,11 +365,13 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
         used_db = True
         logger.info(f"Using existing challenge from DB: {challenge}")
     else:
-        # Get list of topic candidates
-        candidates = get_topic_candidates(instructions)
+        # Extract search query and timestamp for storage
+        search_query = extract_search_query(instructions)
+        timestamp = extract_timestamp(instructions)
+        candidates = get_topic_candidates(instructions, proxy=proxy_for_youtube)
         if not candidates:
             logger.warning(f"No topic candidates found for {offer_id}. Storing for manual review.")
-            store_failed_offer(supabase, offer_id, instructions)
+            store_failed_offer(supabase, offer_id, instructions, search_query, timestamp)
             return False
         used_db = False
 
@@ -366,7 +383,6 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
     user_agent = account["user_agent"]
     max_retries = 3
 
-    # If using DB challenge, we try it once (maybe with retries). Otherwise, iterate candidates.
     if used_db:
         challenges_to_try = [existing]
     else:
@@ -398,8 +414,7 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
             status, data, invalid = post_tune_flow_with_challenge(account, offer_id, uid, challenge)
             if invalid:
                 logger.info(f"Status: {status}, Invalid challenge: {data}")
-                # If it's invalid and we are not using DB, try next candidate
-                break  # break out of retry loop to try next challenge
+                break  # try next candidate
 
             if status == 200 and data and data.get("offer_id") == offer_id:
                 logger.info(f"Status: {status}, Successful: {data}")
@@ -410,17 +425,16 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
             if status is not None:
                 logger.warning(f"Attempt {attempt} failed with status {status}")
 
-        # If we get here, this challenge failed; move to next candidate
         if not used_db:
             logger.info(f"Challenge '{challenge}' failed, trying next candidate...")
         else:
-            # DB challenge failed (all retries), we stop
             break
 
-    # If we exhausted all candidates, store the offer for manual review
     if not used_db:
-        logger.warning(f"All {len(candidates)} candidates failed for {offer_id}. Storing for manual review.")
-        store_failed_offer(supabase, offer_id, instructions)
+        search_query = extract_search_query(instructions)
+        timestamp = extract_timestamp(instructions)
+        logger.warning(f"All candidates failed for {offer_id}. Storing for manual review.")
+        store_failed_offer(supabase, offer_id, instructions, search_query, timestamp)
 
     logger.error(f"Topic offer {offer_id} failed after trying all candidates.")
     return False
