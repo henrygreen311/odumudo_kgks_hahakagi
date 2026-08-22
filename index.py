@@ -7,11 +7,12 @@ from supabase import create_client
 # Disabled modules
 # from module.balance import update_balance
 # from src.link_tasker import process_link_offers
-# from src.text_tasker import process_text_offers
+# from src.topic_tasker import process_topic_offers
 
-# Enable only what we need for topic tasks
+# Enable hashtag_tasker
+from src.hashtag_tasker import process_text_offers
+
 from module.offer import get_account, fetch_offers, classify_offers
-from src.topic_tasker import process_topic_offers
 from module.account_manager import AccountManager
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -45,7 +46,6 @@ def create_supabase_client():
 
 
 def parse_account_id():
-    """Parse command-line argument like 'id=2' and return the integer, or None."""
     for arg in sys.argv[1:]:
         if arg.startswith("id="):
             try:
@@ -53,7 +53,7 @@ def parse_account_id():
             except ValueError:
                 logging.error(f"Invalid account id format: {arg}, expected id=NUMBER")
                 sys.exit(1)
-    return None
+    return 1
 
 
 def main():
@@ -79,24 +79,19 @@ def main():
         acquired_id = manager.account_id
         logging.info(f"Using account ID: {acquired_id}")
 
-        # 1. Fetch the account details (for proxy/cookie/auth)
         account = get_account(supabase, acquired_id)
-
-        # 2. Fetch all offers via proxy
         offers = fetch_offers(account)
         if not offers:
             logging.info("No offers fetched. Exiting.")
             return
 
-        # 3. Classify offers – we only care about topic tasks
-        _, _, topic_tasks = classify_offers(offers)
-        logging.info(f"Topic tasks found: {len(topic_tasks)}")
+        _, text_tasks, _ = classify_offers(offers)
+        logging.info(f"Text tasks found: {len(text_tasks)}")
 
-        if topic_tasks:
-            # 4. Process topic tasks (concurrent, with delay)
-            process_topic_offers(supabase, account, topic_tasks)
+        if text_tasks:
+            process_text_offers(supabase, account, text_tasks)
         else:
-            logging.info("No topic tasks to process.")
+            logging.info("No text tasks to process.")
 
         logging.info("Job finished successfully.")
 
