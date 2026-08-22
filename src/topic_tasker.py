@@ -3,6 +3,7 @@
 import logging
 import re
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs
@@ -16,7 +17,7 @@ from src.proxy_client import proxy_request
 logger = logging.getLogger(__name__)
 
 FINAL_POST_DELAY = 2.5 * 60  # 2.5 minutes
-MAX_WORKERS = 5              # reduced to avoid connection issues
+MAX_WORKERS = 3              # reduced to avoid connection issues
 MAX_CANDIDATES = 5           # try up to 5 topics per offer
 
 # Caches
@@ -39,7 +40,6 @@ def extract_search_query(instructions: str) -> Optional[str]:
 
 
 def extract_timestamp(instructions: str) -> Optional[str]:
-    # Match both 0:30 and 00:30, and also 2:17 or 02:17
     match = re.search(r'\b(\d{1,2}:\d{2}(?::\d{2})?)\b', instructions)
     if match:
         return match.group(1)
@@ -58,11 +58,12 @@ def search_youtube(query: str, max_results: int = 50, proxy: Optional[str] = Non
         'playlistend': max_results,
         'skip_download': True,
         'ignoreerrors': True,
+        'cookiefile': 'cookies.txt',  # <-- use the Netscape cookies file
     }
 
-    if proxy and not proxy.startswith(('http://', 'https://')):
-        proxy = 'http://' + proxy
     if proxy:
+        if not proxy.startswith(('http://', 'https://')):
+            proxy = 'http://' + proxy
         ydl_opts['proxy'] = proxy
         logger.info(f"Using proxy for YouTube: {proxy}")
 
@@ -92,7 +93,6 @@ def extract_topic_from_description(description: str, timestamp: str) -> Optional
     if not description or not timestamp:
         return None
     ts_escaped = re.escape(timestamp)
-    # Look for timestamp followed by optional separator and then text
     pattern = re.compile(rf'{ts_escaped}\s*[-:]\s*(.*?)(?:\n|\.|$)', re.IGNORECASE)
     match = pattern.search(description)
     if match:
@@ -253,7 +253,7 @@ def get_existing_challenge(supabase, offer_id: str) -> Optional[str]:
     if offer_id in _challenge_cache:
         return _challenge_cache[offer_id]
 
-    for attempt in range(1, 5):  # increased to 5 attempts
+    for attempt in range(1, 5):
         try:
             resp = (
                 supabase.table("failed_text_offers")
@@ -271,7 +271,7 @@ def get_existing_challenge(supabase, offer_id: str) -> Optional[str]:
                 return None
             else:
                 logger.warning(f"Supabase error (attempt {attempt}) for {offer_id}: {e}. Retrying in {attempt*2}s...")
-                time.sleep(attempt * 2)  # 2s, 4s, 6s, 8s
+                time.sleep(attempt * 2)
     return None
 
 
@@ -287,7 +287,6 @@ def delete_failed_offer(supabase, offer_id: str) -> None:
 def store_failed_offer(supabase, offer_id: str, instructions: str, search_query: Optional[str] = None, timestamp: Optional[str] = None) -> None:
     """Store failed offer with all available columns to avoid schema errors."""
     table = "failed_text_offers"
-    # Check if already exists with a challenge (use retry)
     existing = None
     for attempt in range(1, 5):
         try:
@@ -309,7 +308,6 @@ def store_failed_offer(supabase, offer_id: str, instructions: str, search_query:
         logger.info(f"Offer {offer_id} already has a challenge, skipping storage.")
         return
 
-    # Build data with all columns that may exist
     data = {
         "task_id": offer_id,
         "instruction": instructions,
@@ -317,7 +315,7 @@ def store_failed_offer(supabase, offer_id: str, instructions: str, search_query:
         "search_query": search_query,
         "timestamp": timestamp,
         "type": "topic",
-        "image_url": None,  # if column exists
+        "image_url": None,
     }
     try:
         if existing:
@@ -349,14 +347,16 @@ def post_tune_flow_with_challenge(account, offer_id: str, user_id: str, challeng
 def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx: int, total: int) -> bool:
     logger.info(f"ID={offer_id} Processing {idx}/{total}")
 
-    # Extract proxy for YouTube
+    # --- YouTube proxy from dedicated column ---
     proxy_for_youtube = None
-    proxy_url = account.get("proxy_url", "")
-    if proxy_url and "infinityfree" not in proxy_url and "jumptask" not in proxy_url:
-        if not proxy_url.startswith(('http://', 'https://')):
-            proxy_url = 'http://' + proxy_url
-        proxy_for_youtube = proxy_url
+    youtube_proxy = account.get("youtube_proxy", "")
+    if youtube_proxy:
+        if not youtube_proxy.startswith(('http://', 'https://')):
+            youtube_proxy = 'http://' + youtube_proxy
+        proxy_for_youtube = youtube_proxy
         logger.info(f"Using YouTube proxy: {proxy_for_youtube}")
+    else:
+        logger.warning("No youtube_proxy set. Direct YouTube requests may be blocked.")
 
     # Check DB for manually filled challenge
     existing = get_existing_challenge(supabase, offer_id)
@@ -365,7 +365,6 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
         used_db = True
         logger.info(f"Using existing challenge from DB: {challenge}")
     else:
-        # Extract search query and timestamp for storage
         search_query = extract_search_query(instructions)
         timestamp = extract_timestamp(instructions)
         candidates = get_topic_candidates(instructions, proxy=proxy_for_youtube)
