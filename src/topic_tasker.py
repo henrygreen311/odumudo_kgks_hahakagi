@@ -3,12 +3,10 @@
 import logging
 import re
 import time
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
-import yt_dlp
 import requests
 
 from src.task_utils import get_tune_flow, get_affiliate_url
@@ -17,15 +15,16 @@ from src.proxy_client import proxy_request
 logger = logging.getLogger(__name__)
 
 FINAL_POST_DELAY = 2.5 * 60  # 2.5 minutes
-MAX_WORKERS = 3              # reduced to avoid connection issues
-MAX_CANDIDATES = 5           # try up to 5 topics per offer
+MAX_WORKERS = 3
+MAX_CANDIDATES = 5
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 # Caches
 _youtube_cache = {}
 _challenge_cache = {}
 
 
-# ---------- YouTube helpers ----------
+# ---------- YouTube API helpers ----------
 def extract_search_query(instructions: str) -> Optional[str]:
     clean = instructions.replace('*', '')
     patterns = [
@@ -46,46 +45,67 @@ def extract_timestamp(instructions: str) -> Optional[str]:
     return None
 
 
-def search_youtube(query: str, max_results: int = 50, proxy: Optional[str] = None) -> List[Dict[str, str]]:
-    cache_key = f"{query}_{max_results}_{proxy}"
+def search_youtube_api(query: str, api_key: str, max_results: int = 50, proxy: Optional[str] = None) -> List[Dict[str, str]]:
+    """Search YouTube using the official API and return video metadata."""
+    cache_key = f"{query}_{max_results}_{api_key[:4]}"  # only key prefix for cache
     if cache_key in _youtube_cache:
         return _youtube_cache[cache_key]
 
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'playlistend': max_results,
-        'skip_download': True,
-        'ignoreerrors': True,
-        'cookiefile': 'cookies.txt',  # <-- use the Netscape cookies file
+    # Step 1: Search for videos
+    search_url = f"{YOUTUBE_API_BASE}/search"
+    params = {
+        'part': 'snippet',
+        'q': query,
+        'type': 'video',
+        'maxResults': max_results,
+        'key': api_key,
     }
-
-    if proxy:
-        if not proxy.startswith(('http://', 'https://')):
-            proxy = 'http://' + proxy
-        ydl_opts['proxy'] = proxy
-        logger.info(f"Using proxy for YouTube: {proxy}")
-
-    search_url = f"ytsearch{max_results}:{query}"
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_url, download=False)
-            entries = info.get('entries', [])
-            results = []
-            for entry in entries:
-                if entry is None:
-                    continue
-                results.append({
-                    'url': entry.get('webpage_url'),
-                    'title': entry.get('title'),
-                    'description': entry.get('description') or '',
-                })
-            _youtube_cache[cache_key] = results
-            logger.info(f"Found {len(results)} videos for query '{query}'")
-            return results
-    except Exception as e:
-        logger.error(f"YouTube search failed for '{query}': {e}")
+        session = requests.Session()
+        if proxy:
+            session.proxies = {'http': proxy, 'https': proxy}
+        response = session.get(search_url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        video_ids = []
+        for item in data.get('items', []):
+            video_id = item.get('id', {}).get('videoId')
+            if video_id:
+                video_ids.append(video_id)
+
+        if not video_ids:
+            logger.warning(f"No videos found for query '{query}'")
+            return []
+
+        # Step 2: Fetch video details (descriptions)
+        details_url = f"{YOUTUBE_API_BASE}/videos"
+        details_params = {
+            'part': 'snippet',
+            'id': ','.join(video_ids),
+            'key': api_key,
+        }
+        response = session.get(details_url, params=details_params, timeout=15)
+        response.raise_for_status()
+        details_data = response.json()
+
+        results = []
+        for item in details_data.get('items', []):
+            snippet = item.get('snippet', {})
+            results.append({
+                'url': f"https://www.youtube.com/watch?v={item['id']}",
+                'title': snippet.get('title', ''),
+                'description': snippet.get('description', ''),
+            })
+        _youtube_cache[cache_key] = results
+        logger.info(f"Found {len(results)} videos for query '{query}'")
+        return results
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"YouTube API request failed for '{query}': {e}")
+        return []
+    except KeyError as e:
+        logger.error(f"Unexpected API response structure for '{query}': {e}")
         return []
 
 
@@ -117,7 +137,7 @@ def extract_topic_from_description(description: str, timestamp: str) -> Optional
     return None
 
 
-def get_topic_candidates(instructions: str, proxy: Optional[str] = None, max_candidates: int = MAX_CANDIDATES) -> List[str]:
+def get_topic_candidates(instructions: str, api_key: str, proxy: Optional[str] = None, max_candidates: int = MAX_CANDIDATES) -> List[str]:
     query = extract_search_query(instructions)
     if not query:
         logger.warning("Could not extract search query from instructions.")
@@ -127,8 +147,8 @@ def get_topic_candidates(instructions: str, proxy: Optional[str] = None, max_can
         logger.warning("Could not extract timestamp from instructions.")
         return []
 
-    logger.info(f"Searching YouTube for '{query}' with timestamp {timestamp}...")
-    videos = search_youtube(query, max_results=50, proxy=proxy)
+    logger.info(f"Searching YouTube API for '{query}' with timestamp {timestamp}...")
+    videos = search_youtube_api(query, api_key, max_results=50, proxy=proxy)
     candidates = []
     seen = set()
     for video in videos:
@@ -147,6 +167,7 @@ def get_topic_candidates(instructions: str, proxy: Optional[str] = None, max_can
 
 # ---------- Affiliate link handler (with fallback for 200) ----------
 def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[str, str]]:
+    # (unchanged from previous version)
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -190,7 +211,6 @@ def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[
         elif status == 200:
             logger.warning("Affiliate link returned 200 instead of 302. Attempting to parse response.")
             body = resp.text
-
             patterns = [
                 r'<meta[^>]+url=([^"\']+)[\'"]',
                 r'<a[^>]+href=(["\'])([^"\']+)\1',
@@ -219,7 +239,6 @@ def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[
                         "user_id": user_id,
                     }
 
-            # Fallback: search body for transaction_id
             tx_match = re.search(r'transaction_id["\']?\s*[:=]\s*["\']?([a-f0-9]+)["\']?', body, re.IGNORECASE)
             if tx_match:
                 transaction_id = tx_match.group(1)
@@ -285,7 +304,6 @@ def delete_failed_offer(supabase, offer_id: str) -> None:
 
 
 def store_failed_offer(supabase, offer_id: str, instructions: str, search_query: Optional[str] = None, timestamp: Optional[str] = None) -> None:
-    """Store failed offer with all available columns to avoid schema errors."""
     table = "failed_text_offers"
     existing = None
     for attempt in range(1, 5):
@@ -347,16 +365,19 @@ def post_tune_flow_with_challenge(account, offer_id: str, user_id: str, challeng
 def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx: int, total: int) -> bool:
     logger.info(f"ID={offer_id} Processing {idx}/{total}")
 
-    # --- YouTube proxy from dedicated column ---
-    proxy_for_youtube = None
-    youtube_proxy = account.get("youtube_proxy", "")
-    if youtube_proxy:
-        if not youtube_proxy.startswith(('http://', 'https://')):
-            youtube_proxy = 'http://' + youtube_proxy
-        proxy_for_youtube = youtube_proxy
-        logger.info(f"Using YouTube proxy: {proxy_for_youtube}")
-    else:
-        logger.warning("No youtube_proxy set. Direct YouTube requests may be blocked.")
+    # Get API key and proxy
+    api_key = account.get("youtube_api_key", "").strip()
+    if not api_key:
+        logger.error(f"No YouTube API key set for account. Please add youtube_api_key to the jumptask table.")
+        return False
+
+    proxy_for_requests = None
+    proxy_url = account.get("proxy_url", "")
+    if proxy_url and "infinityfree" not in proxy_url and "jumptask" not in proxy_url:
+        if not proxy_url.startswith(('http://', 'https://')):
+            proxy_url = 'http://' + proxy_url
+        proxy_for_requests = proxy_url
+        logger.info(f"Using proxy for API requests: {proxy_for_requests}")
 
     # Check DB for manually filled challenge
     existing = get_existing_challenge(supabase, offer_id)
@@ -367,7 +388,7 @@ def process_topic_offer(supabase, account, offer_id: str, instructions: str, idx
     else:
         search_query = extract_search_query(instructions)
         timestamp = extract_timestamp(instructions)
-        candidates = get_topic_candidates(instructions, proxy=proxy_for_youtube)
+        candidates = get_topic_candidates(instructions, api_key, proxy=proxy_for_requests)
         if not candidates:
             logger.warning(f"No topic candidates found for {offer_id}. Storing for manual review.")
             store_failed_offer(supabase, offer_id, instructions, search_query, timestamp)
