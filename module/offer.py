@@ -3,14 +3,20 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from src.proxy_client import proxy_request
 
+# Disabled link and topic taskers
+# from src.link_tasker import process_link_offers
+# from src.topic_tasker import process_topic_offers
+
+# Enable hashtag_tasker
+from src.hashtag_tasker import process_text_offers
+
 logger = logging.getLogger(__name__)
 
 
 def get_account(supabase, account_id: int = 1) -> Dict[str, Any]:
-    """Fetch all required account credentials from the jumptask table."""
     result = (
         supabase.table("jumptask")
-        .select("id, auth, user_agent, uid, proxy_url, cookie, youtube_api_key")  # <-- added youtube_api_key
+        .select("id, auth, user_agent, uid, proxy_url, cookie, youtube_api_key")
         .eq("id", account_id)
         .single()
         .execute()
@@ -75,23 +81,21 @@ def fetch_and_log_offers(supabase, account_id: int = 1) -> Optional[List[Dict[st
     logger.info(f"Topic task: {len(topic_tasks)}")
 
     if click_ids:
-        from src.link_tasker import process_link_offers
-        process_link_offers(account, click_ids)
+        # process_link_offers(account, click_ids)
+        pass
 
     if text_tasks:
-        from src.text_tasker import process_text_offers
         process_text_offers(supabase, account, text_tasks)
 
     if topic_tasks:
-        from src.topic_tasker import process_topic_offers
-        process_topic_offers(supabase, account, topic_tasks)
+        # process_topic_offers(supabase, account, topic_tasks)
+        pass
 
     return offers
 
 
 if __name__ == "__main__":
     from index import create_supabase_client
-    import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     supabase = create_supabase_client()
     fetch_and_log_offers(supabase, account_id=1)
