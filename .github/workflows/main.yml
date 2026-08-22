@@ -23,7 +23,7 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run index.py
+      - name: Run runner.py
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
