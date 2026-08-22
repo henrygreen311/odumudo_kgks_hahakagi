@@ -1,4 +1,4 @@
-# src/text_tasker.py
+# src/hashtag_tasker.py
 
 import logging
 import re
@@ -114,7 +114,6 @@ def get_hashtag_candidates(main_hashtag: str, api_key: str, proxy: Optional[str]
 
     result = [main_hashtag] + sorted(candidates - {main_hashtag})
 
-    # Log with truncation if more than 10 candidates
     if len(result) > 10:
         preview = result[:5]
         others = len(result) - 5
@@ -275,16 +274,23 @@ def process_offer_with_delay(supabase, account, offer_id: str, instructions: str
 
     user_agent = account["user_agent"]
     max_retries = 3
+    tried_count = 0
 
+    # First candidate gets the delay and full logging
     for idx_candidate, challenge in enumerate(candidates):
         if idx_candidate == 0:
             logger.info(f"Waiting {FINAL_POST_DELAY/60:.1f} minutes before first POST for {offer_id}...")
             time.sleep(FINAL_POST_DELAY)
-
-        logger.info(f"Trying challenge: '{challenge}' for offer {offer_id}")
+            # Log the first candidate attempt (only once)
+            logger.info(f"Trying challenge: '{challenge}' for offer {offer_id}")
+        else:
+            # For subsequent candidates, log nothing unless success
+            pass
 
         for attempt in range(1, max_retries + 1):
-            logger.info(f"Attempt {attempt}/{max_retries} for text offer {offer_id} (challenge: {challenge[:30]}...)")
+            # Only log attempts for the first candidate
+            if idx_candidate == 0:
+                logger.info(f"Attempt {attempt}/{max_retries} for text offer {offer_id}")
 
             affiliate_url = get_affiliate_url(account, offer_id)
             if not affiliate_url:
@@ -302,19 +308,26 @@ def process_offer_with_delay(supabase, account, offer_id: str, instructions: str
             status, data, invalid = post_tune_flow_with_challenge(account, offer_id, uid, challenge)
 
             if invalid:
-                logger.info(f"Status: {status}, Invalid challenge: {data}")
+                # Only log invalid for first candidate
+                if idx_candidate == 0:
+                    logger.info(f"Status: {status}, Invalid challenge: {data}")
                 break  # try next candidate
 
             if status == 200 and data and data.get("offer_id") == offer_id:
                 logger.info(f"Status: {status}, Successful: {data}")
                 return True
 
+            # If we get here, something else failed (not invalid challenge)
             if status is not None:
-                logger.warning(f"Attempt {attempt} failed with status {status}")
+                # Only log if it's the first candidate
+                if idx_candidate == 0:
+                    logger.warning(f"Attempt {attempt} failed with status {status}")
 
-        logger.info(f"Challenge '{challenge}' failed, trying next candidate...")
+        # If we exhausted retries for this candidate, move on
+        tried_count += 1
 
-    logger.error(f"Text offer {offer_id} failed after trying all candidates.")
+    # If we exit the loop, all candidates failed
+    logger.error(f"Offer {offer_id} failed after trying {tried_count} candidates.")
     return False
 
 
