@@ -1,3 +1,4 @@
+# src/task_utils.py
 import logging
 import requests
 from typing import Dict, Any, Optional
@@ -9,7 +10,7 @@ logger = logging.getLogger(__name__)
 def get_account(supabase, account_id: int) -> Dict[str, Any]:
     result = (
         supabase.table("jumptask")
-        .select("auth, user_agent, uid, proxy_url, cookie")
+        .select("auth, user_agent, uid, proxy_url, cookie, youtube_api_key")
         .eq("id", account_id)
         .single()
         .execute()
@@ -29,7 +30,7 @@ def get_affiliate_url(account, offer_id: str) -> Optional[str]:
     return data.get("url")
 
 def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[str, str]]:
-    # Direct request to go2cloud.org – no proxy
+    """Follow the affiliate link and extract transaction_id and other params."""
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -47,28 +48,100 @@ def follow_affiliate_link(affiliate_url: str, user_agent: str) -> Optional[Dict[
     }
     try:
         resp = requests.get(affiliate_url, headers=headers, timeout=15, allow_redirects=False)
-        if resp.status_code != 302:
-            logger.error(f"Affiliate link did not return 302, got {resp.status_code}")
+        status = resp.status_code
+
+        if status == 302:
+            location = resp.headers.get("Location")
+            if not location:
+                logger.error("No Location header in 302 response")
+                return None
+            parsed = urlparse(location)
+            query = parse_qs(parsed.query)
+            transaction_id = query.get("transaction_id", [None])[0]
+            destination = query.get("destination", [None])[0]
+            advertiser = query.get("advertiser", [None])[0]
+            user_id = query.get("user_id", [None])[0]
+
+            # Require at least transaction_id and user_id
+            if not transaction_id or not user_id:
+                logger.error(f"Missing transaction_id or user_id in Location: {location}")
+                return None
+
+            # Set defaults for missing optional fields
+            if not destination:
+                destination = "https://youtube.com"
+                logger.warning(f"destination missing, using default: {destination}")
+            if not advertiser:
+                advertiser = "jtyoutube"
+                logger.warning(f"advertiser missing, using default: {advertiser}")
+
+            return {
+                "transaction_id": transaction_id,
+                "destination": destination,
+                "advertiser": advertiser,
+                "user_id": user_id,
+            }
+
+        elif status == 200:
+            # ... (keep existing parsing logic, but also apply same defaults)
+            logger.warning("Affiliate link returned 200 instead of 302. Attempting to parse response.")
+            body = resp.text
+            patterns = [
+                r'<meta[^>]+url=([^"\']+)[\'"]',
+                r'<a[^>]+href=(["\'])([^"\']+)\1',
+                r'window\.location\s*=\s*["\']([^"\']+)["\']',
+                r'location\.href\s*=\s*["\']([^"\']+)["\']',
+            ]
+            target_url = None
+            for pattern in patterns:
+                match = re.search(pattern, body, re.IGNORECASE)
+                if match:
+                    target_url = match.group(1) if len(match.groups()) == 1 else match.group(2)
+                    break
+
+            if target_url:
+                parsed = urlparse(target_url)
+                query = parse_qs(parsed.query)
+                transaction_id = query.get("transaction_id", [None])[0]
+                destination = query.get("destination", [None])[0]
+                advertiser = query.get("advertiser", [None])[0]
+                user_id = query.get("user_id", [None])[0]
+
+                if transaction_id and user_id:
+                    if not destination:
+                        destination = "https://youtube.com"
+                    if not advertiser:
+                        advertiser = "jtyoutube"
+                    return {
+                        "transaction_id": transaction_id,
+                        "destination": destination,
+                        "advertiser": advertiser,
+                        "user_id": user_id,
+                    }
+
+            # Fallback: search body for transaction_id and user_id
+            tx_match = re.search(r'transaction_id["\']?\s*[:=]\s*["\']?([a-f0-9]+)["\']?', body, re.IGNORECASE)
+            user_match = re.search(r'user_id["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+            if tx_match and user_match:
+                transaction_id = tx_match.group(1)
+                user_id = user_match.group(1)
+                dest_match = re.search(r'destination["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                adv_match = re.search(r'advertiser["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', body, re.IGNORECASE)
+                destination = dest_match.group(1) if dest_match else "https://youtube.com"
+                advertiser = adv_match.group(1) if adv_match else "jtyoutube"
+                return {
+                    "transaction_id": transaction_id,
+                    "destination": destination,
+                    "advertiser": advertiser,
+                    "user_id": user_id,
+                }
+            logger.error("Could not extract transaction_id and user_id from 200 response.")
             return None
-        location = resp.headers.get("Location")
-        if not location:
-            logger.error("No Location header in 302 response")
+
+        else:
+            logger.error(f"Affiliate link returned unexpected status: {status}")
             return None
-        parsed = urlparse(location)
-        query = parse_qs(parsed.query)
-        transaction_id = query.get("transaction_id", [None])[0]
-        destination = query.get("destination", [None])[0]
-        advertiser = query.get("advertiser", [None])[0]
-        user_id = query.get("user_id", [None])[0]
-        if not all([transaction_id, destination, advertiser, user_id]):
-            logger.error(f"Missing required parameters in Location: {location}")
-            return None
-        return {
-            "transaction_id": transaction_id,
-            "destination": destination,
-            "advertiser": advertiser,
-            "user_id": user_id,
-        }
+
     except Exception as e:
         logger.error(f"Failed to follow affiliate link: {e}")
         return None
