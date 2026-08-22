@@ -4,13 +4,11 @@ import sys
 import signal
 from supabase import create_client
 
-# Disabled modules
-# from module.balance import update_balance
-# from src.link_tasker import process_link_offers
-# from src.topic_tasker import process_topic_offers
-
-# Enable hashtag_tasker
+# Enable all modules
+from module.balance import update_balance
+from src.link_tasker import process_link_offers
 from src.hashtag_tasker import process_text_offers
+from src.topic_tasker import process_topic_offers
 
 from module.offer import get_account, fetch_offers, classify_offers
 from module.account_manager import AccountManager
@@ -79,19 +77,35 @@ def main():
         acquired_id = manager.account_id
         logging.info(f"Using account ID: {acquired_id}")
 
+        # 1. Update balance
+        logging.info(f"Updating balance for account {acquired_id}...")
+        update_balance(supabase, account_id=acquired_id)
+
+        # 2. Fetch account details and offers
         account = get_account(supabase, acquired_id)
         offers = fetch_offers(account)
         if not offers:
             logging.info("No offers fetched. Exiting.")
             return
 
-        _, text_tasks, _ = classify_offers(offers)
-        logging.info(f"Text tasks found: {len(text_tasks)}")
+        # 3. Classify offers
+        click_ids, text_tasks, topic_tasks = classify_offers(offers)
+        logging.info(f"Click link tasks: {len(click_ids)}")
+        logging.info(f"Text (hashtag) tasks: {len(text_tasks)}")
+        logging.info(f"Topic tasks: {len(topic_tasks)}")
+
+        # 4. Process each category
+        if click_ids:
+            logging.info("Processing link tasks...")
+            process_link_offers(account, click_ids)
 
         if text_tasks:
+            logging.info("Processing text (hashtag) tasks...")
             process_text_offers(supabase, account, text_tasks)
-        else:
-            logging.info("No text tasks to process.")
+
+        if topic_tasks:
+            logging.info("Processing topic tasks...")
+            process_topic_offers(supabase, account, topic_tasks)
 
         logging.info("Job finished successfully.")
 
